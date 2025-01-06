@@ -491,4 +491,4 @@ async def on_ready():
     await music_bot.tree.sync()
 
 # 运行机器人
-music_bot.run("")
+music_bot.run("TOKEN")
