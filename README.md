@@ -22,7 +22,7 @@
 1. 需要安装的库：
 
    ```bash
-   pip install discord.py pynacl pytubefix
+   pip install discord.py pynacl yt-dlp
 
 ## 使用教程
 

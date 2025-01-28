@@ -2,10 +2,10 @@ import os
 import re
 import shutil
 import discord
-import subprocess
-from pytubefix import YouTube
+import yt_dlp
 from discord.ext import commands
-from pytubefix.cli import on_progress
+import functools
+import asyncio
 
 # 设置Discord客户端和机器人命令前缀
 intents = discord.Intents.all()
@@ -32,25 +32,64 @@ async def check_voice_channel(ctx, voice_client):
     
     return True
 
-def process_video(url, output_path, temp_suffix="_temp.mp3", final_suffix=".mp3"):
-    """
-    处理 YouTube 视频，下载音频流并生成文件路径
-    :param url: YouTube 视频链接
-    :param output_path: 音频保存路径
-    :param temp_suffix: 临时文件后缀
-    :param final_suffix: 最终文件后缀
-    :return: 视频标题、临时文件路径、最终文件路径
-    """
-    video = YouTube(url, on_progress_callback=on_progress)
-    stream = video.streams.filter(only_audio=True).first()
-    filename = re.sub(r'[^\w\u4e00-\u9fa5]', '_', video.title).replace(' ', '')
-    
-    temp_output_file = f"{output_path}/{filename}{temp_suffix}"
-    final_output_file = f"{output_path}/{filename}{final_suffix}"
-    
-    return filename, stream, temp_output_file, final_output_file
+def process_video(url, output_path):
+    try:
+        # 处理URL，提取视频ID
+        def clean_url(url):
+            # 如果URL包含'='，提取视频ID
+            if '=' in url:
+                video_id = url.split('=')[-1].split('&')[0]  # 处理可能的额外参数
+                return f"https://youtu.be/{video_id}"
+            # 如果URL不包含'='，可能是短链接格式，直接移除查询参数
+            return url.split('?')[0]
+        
+        cleaned_url = clean_url(url)
+        
+        # 先用临时选项获取视频信息
+        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+            info = ydl.extract_info(cleaned_url, download=False)
+            if not info:
+                raise ValueError("无法获取视频信息")
+            
+            # 获取标题并处理文件名
+            title = info.get('title', '')
+            if not title:
+                raise ValueError("无法获取视频标题")
+                
+            filename = re.sub(r'[^\w\u4e00-\u9fa5]', '_', title).replace(' ', '')
+            final_output_file = f"{output_path}/{filename}.mp3"
+            
+            # 检查文件是否已存在
+            if os.path.exists(final_output_file):
+                return filename, final_output_file, "exists"
+            
+            # 如果文件不存在，设置下载选项
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+                'quiet': True,
+                'no_warnings': True,
+                'outtmpl': final_output_file[:-4],  # 移除.mp3后缀，yt-dlp会自动添加
+            }
+            
+            # 下载文件
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([cleaned_url])
+            
+            return filename, final_output_file, "downloaded"
+            
+    except Exception as e:
+        print(f"下载出错: {str(e)}")
+        raise
 
-# 播放音乐的函数
+# 全局变量保存主线程的事件循环
+main_loop = asyncio.get_event_loop()
+
+# 播放音乐函数
 async def play_audio(ctx):
     global current_music_index, music_queue, voice_client
 
@@ -63,12 +102,24 @@ async def play_audio(ctx):
     source = discord.FFmpegPCMAudio(executable="ffmpeg.exe", source=music)
     source = discord.PCMVolumeTransformer(source, volume=current_volume)
     
-    # 播放音频，并设置播放完成后的回调
-    voice_client.play(source, after=lambda e: on_song_end(ctx, e))
+    # 使用 partial 传递额外参数
+    voice_client.play(source, after=functools.partial(sync_on_song_end, ctx, main_loop))
+
+# 同步函数调用协程
+def sync_on_song_end(ctx, loop, error):
+    if error:
+        print(f"播放过程中出错: {error}")
+    # 在指定的事件循环中调度协程
+    asyncio.run_coroutine_threadsafe(on_song_end(ctx, error), loop)
 
 # 播放完成后的回调函数
-async def on_song_end(ctx):
+async def on_song_end(ctx, error):
     global current_music_index, voice_client
+
+    if error:
+        print(f"播放过程中出错: {error}")
+        await ctx.send(f"```播放过程中发生错误: {error}```")
+        return
 
     # 播放下一首歌曲
     if current_music_index < len(music_queue) - 1:
@@ -77,8 +128,8 @@ async def on_song_end(ctx):
     else:
         # 如果播放完所有歌曲，重新从头播放
         current_music_index = 0
-        await play_audio(ctx)
         await ctx.send(f"```{ctx.author.name}, 单曲播放已结束，正在重新从头播放!```")
+        await play_audio(ctx)
         
 # 加入语音频道命令
 @music_bot.command(name="join")
@@ -143,12 +194,11 @@ async def volume(ctx, new_volume):
 @music_bot.command(name="play")
 async def play(ctx, url):
     global current_music_index, music_queue, voice_client
-    voice_client = ctx.guild.voice_client # 获取当前语音频道的客户端
+    voice_client = ctx.guild.voice_client
 
     if not await check_voice_channel(ctx, voice_client):
         return
     
-    # 如果音乐在播放或暂停
     if voice_client.is_paused() or voice_client.is_playing():
         await ctx.send(f"```{ctx.author.name}, 请先使用 /stop 命令停止当前音乐后再使用此命令!```")
         return
@@ -157,36 +207,20 @@ async def play(ctx, url):
 
     try:
         output_path = "music"
-        filename, stream, temp_output_file, final_output_file = process_video(url, output_path)
-
-        # 检查文件是否已经存在
-        if os.path.exists(final_output_file):
-            await ctx.send(f"```{ctx.author.name}, {filename} 已存在!```")
-            
-        else:
-            # 下载视频并转换为音频文件
-            stream.download(output_path=output_path, filename=os.path.basename(temp_output_file))
-
-            ffmpeg_command = [
-                'ffmpeg',
-                '-y', 
-                '-i', temp_output_file,
-                '-acodec', 'libmp3lame',
-                '-q:a', '2',
-                final_output_file
-            ]
-
-            subprocess.run(ffmpeg_command, check=True)
-            os.remove(temp_output_file)
-
+        filename, final_output_file, status = process_video(url, output_path)
+        
         music_queue.append(final_output_file)
-        current_music_index = len(music_queue) - 1  # 更新当前播放的音乐索引
+        current_music_index = len(music_queue) - 1
 
-    except:
-        await ctx.send(f"```{ctx.author.name}, 请确保输入的是有效的YouTube视频链接!```")
+        if status == "exists":
+            await ctx.send(f"```{ctx.author.name}, 音乐文件已存在，无需重新下载```")
+        else:
+            await ctx.send(f"```{ctx.author.name}, 下载完成```")
+
+    except Exception as e:
+        await ctx.send(f"```{ctx.author.name}, 下载失败: {str(e)}```")
         return
 
-    # 开始播放音乐
     if not voice_client.is_playing():
         await play_audio(ctx)
 
@@ -254,69 +288,50 @@ async def playlist(ctx, foldername, *url_list):
 
     foldername = f"music/{foldername}"
     
-    # 遍历url_list并下载每个视频
     for url in url_list:
         try:
-            filename, stream, temp_output_file, final_output_file = process_video(url, foldername)
-
-            if os.path.exists(final_output_file):
-                await ctx.send(f"```{ctx.author.name}, {filename} 已在 {foldername} 播放列表中！```")
-            
+            filename, final_output_file, status = process_video(url, foldername)
+            if status == "exists":
+                await ctx.send(f"```{ctx.author.name}, {filename} 已存在于 {foldername} 播放列表中```")
             else:
-                stream.download(output_path=foldername, filename=os.path.basename(temp_output_file))
-
-                ffmpeg_command = [
-                    'ffmpeg',
-                    '-y', 
-                    '-i', temp_output_file,
-                    '-acodec', 'libmp3lame',
-                    '-q:a', '2',
-                    final_output_file
-                ]
-
-                subprocess.run(ffmpeg_command, check=True)
-                os.remove(temp_output_file)
-
                 await ctx.send(f"```{ctx.author.name}, {filename} 已添加到 {foldername} 播放列表！```")
-
-        except:
-            await ctx.send(f"```{ctx.author.name}, 处理 {url} 时发生错误，请检查链接是否有效。```")
+        except Exception as e:
+            await ctx.send(f"```{ctx.author.name}, 处理 {url} 时发生错误: {str(e)}```")
 
 # 播放列表命令
 @music_bot.command(name="play_playlist")
 async def play_playlist(ctx, playlist):
     global current_music_index, music_queue, voice_client
+    
     # 检查播放列表是否存在
-    if os.path.exists(f"music/{playlist}") and os.path.isdir(f"music/{playlist}"):
-        music_list = os.listdir(f"music/{playlist}")
-        music_queue.extend([f"music/{playlist}/{music}" for music in music_list])  # 添加所有音乐到队列
-        current_music_index = 0  # 从列表的第一首开始播放
-
-        voice_client = ctx.guild.voice_client
-
-        if not await check_voice_channel(ctx, voice_client):
-            return
-
-        if voice_client.is_paused() or voice_client.is_playing():
-            await ctx.send(f"```{ctx.author.name}, 请先使用 /stop 停止音乐，然后再使用此命令!```")
-            return
-
-        music_queue.clear()  # 清空音乐队列
-        for music in music_list:
-            music_queue.append(f"music/{playlist}/{music}")  # 添加播放列表中的音乐文件到队列
-
-        current_music_index = 0  # 设置为播放列表的第一首音乐
-
-        # 开始播放音乐
-        if not voice_client.is_playing():
-            await play_audio(ctx)
-
-        current_music = music_queue[current_music_index].split('/')[-1]  # 获取音乐文件名
-
-        await ctx.send(f"```{ctx.author.name}, 正在播放播放列表: {playlist}, {current_music}```")
-
-    else:
+    if not (os.path.exists(f"music/{playlist}") and os.path.isdir(f"music/{playlist}")):
         await ctx.send(f"```{ctx.author.name}, {playlist} 播放列表不存在!```")
+        return
+
+    voice_client = ctx.guild.voice_client
+    if not await check_voice_channel(ctx, voice_client):
+        return
+
+    if voice_client.is_paused() or voice_client.is_playing():
+        await ctx.send(f"```{ctx.author.name}, 请先使用 /stop 停止音乐，然后再使用此命令!```")
+        return
+
+    # 获取播放列表中的所有音乐
+    music_list = os.listdir(f"music/{playlist}")
+    
+    # 清空并重新添加音乐队列
+    music_queue.clear()
+    music_queue.extend([f"music/{playlist}/{music}" for music in music_list])
+    
+    # 设置为播放列表的第一首音乐
+    current_music_index = 0
+
+    # 开始播放音乐
+    if not voice_client.is_playing():
+        await play_audio(ctx)
+
+    current_music = music_queue[current_music_index].split('/')[-1]
+    await ctx.send(f"```{ctx.author.name}, 正在播放播放列表: {playlist}, {current_music}```")
 
 # 上一首命令
 @music_bot.command(name="previous")
@@ -366,100 +381,120 @@ async def next(ctx):
 @music_bot.command(name="view_all")
 async def view_all(ctx):
     # 列出所有文件和文件夹的函数
-    async def list_files_and_folders(path):
-        items = os.listdir(path) # 获取目录中的所有项目
+    async def list_files_and_folders(path, indent=""):
+        items = os.listdir(path)
         
-        # 如果目录为空
         if len(items) == 0:
             await ctx.send(f"```{ctx.author.name}, 音乐和播放列表为空!```")
             return
         
-        else:
-            for item in items:
-                item_path = os.path.join(path, item)
-
-                # 如果是目录，则显示播放列表内容
-                if os.path.isdir(item_path):
-                    await ctx.send(f"```{item} 播放列表:```")
-                    await list_files_and_folders(item_path)
-                    
-                else:
-                    # 如果是音乐文件，显示音乐名称
-                    folder_content = re.sub(r'\.mp3$', '', item)
-                    await ctx.send(f"```{folder_content}```")
+        # 分离文件夹和文件
+        folders = []
+        files = []
+        for item in items:
+            item_path = os.path.join(path, item)
+            if os.path.isdir(item_path):
+                folders.append(item)
+            else:
+                files.append(item)
+                
+        # 先处理播放列表（文件夹）
+        for folder in folders:
+            folder_path = os.path.join(path, folder)
+            await ctx.send(f"```{folder} 播放列表:```")
+            # 递归处理播放列表内的文件，增加缩进
+            folder_items = os.listdir(folder_path)
+            for item in folder_items:
+                if item.endswith('.mp3'):
+                    music_name = re.sub(r'\.mp3$', '', item)
+                    await ctx.send(f"```  {music_name}```")
+        
+        # 再处理非播放列表的音乐文件
+        if files and path == "music":  # 只在根目录显示"单曲:"
+            await ctx.send("```单曲:```")
+            for file in files:
+                if file.endswith('.mp3'):
+                    music_name = re.sub(r'\.mp3$', '', file)
+                    await ctx.send(f"```{music_name}```")
 
     # 从根目录开始列出所有音乐和播放列表
     await list_files_and_folders("music")
 
 # 删除播放列表命令
 @music_bot.command(name="delete_playlist")
-async def delete_playlist(ctx, *playlist_list):
-    voice_client = ctx.guild.voice_client # 获取语音客户端
-
-    if not await check_voice_channel(ctx, voice_client):
-        return
-
-    # 如果正在播放或暂停播放，要求先停止音乐
-    if voice_client.is_paused() or voice_client.is_playing():
-        await ctx.send(f"```{ctx.author.name}, 请先使用 /stop 停止音乐，然后再使用此命令!```")
-        return
+async def delete_playlist(ctx, playlist):
+    global voice_client, music_queue, current_music_index
     
-    # 删除指定的播放列表
-    for playlist in playlist_list:
-        if os.path.exists(f"music/{playlist}") and os.path.isdir(f"music/{playlist}"):
-            shutil.rmtree(f"music/{playlist}") # 删除目录
-            await ctx.send(f"```{ctx.author.name}, {playlist} 播放列表删除成功!```")
-
-        else:
-            await ctx.send(f"```{ctx.author.name}, {playlist} 播放列表不存在!```")
-
-# 删除播放列表音乐命令
-@music_bot.command(name="delete_playlist_music")
-async def delete_playlist_music(ctx, playlist, *music_list):
-    voice_client = ctx.guild.voice_client # 获取语音客户端
-
-    if not await check_voice_channel(ctx, voice_client):
-        return
-    
-    # 如果正在播放或暂停播放，要求先停止音乐
-    if voice_client.is_paused() or voice_client.is_playing():
-        await ctx.send(f"```{ctx.author.name}, 请先使用 /stop 停止音乐，然后再使用此命令!```")
-        return
-    
-    # 删除指定播放列表中的音乐
-    if os.path.exists(f"music/{playlist}") and os.path.isdir(f"music/{playlist}"):
-        for music in music_list:
-            if os.path.exists(f"music/{playlist}/{music}.mp3"):
-                os.remove(f"music/{playlist}/{music}.mp3") # 删除指定的音乐文件
-                await ctx.send(f"```{ctx.author.name}, {music} 已成功从 {playlist} 播放列表中删除!```")
-
-            else:
-                await ctx.send(f"```{ctx.author.name}, {music} 在 {playlist} 播放列表中不存在!```")
-       
-    else:
+    # 检查播放列表是否存在
+    if not (os.path.exists(f"music/{playlist}") and os.path.isdir(f"music/{playlist}")):
         await ctx.send(f"```{ctx.author.name}, {playlist} 播放列表不存在!```")
-
-# 删除音乐命令
-@music_bot.command(name="delete_music")
-async def delete_music(ctx, *music_list):
-    voice_client = ctx.guild.voice_client # 获取语音客户端
-
-    if not await check_voice_channel(ctx, voice_client):
         return
 
-    # 如果正在播放或暂停播放，要求先停止音乐
-    if voice_client.is_paused() or voice_client.is_playing():
-        await ctx.send(f"```{ctx.author.name}, 请先使用 /stop 停止音乐，然后再使用此命令!```")
-        return
+    # 如果正在播放，先停止
+    if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
+        voice_client.stop()
+        music_queue.clear()
+        current_music_index = 0
+        await ctx.send(f"```{ctx.author.name}, 已停止当前播放的音乐```")
+
+    try:
+        # 删除播放列表文件夹及其内容
+        shutil.rmtree(f"music/{playlist}")
+        await ctx.send(f"```{ctx.author.name}, {playlist} 播放列表已删除!```")
+    except Exception as e:
+        await ctx.send(f"```{ctx.author.name}, 删除 {playlist} 播放列表时发生错误: {str(e)}```")
+
+@music_bot.command(name="delete_playlist_music")
+async def delete_playlist_music(ctx, playlist, music_name):
+    global voice_client, music_queue, current_music_index
     
-    # 删除指定的音乐文件
-    for music in music_list:
-        if os.path.exists(f"music/{music}.mp3") and not os.path.isdir(f"music/{music}.mp3"):
-            os.remove(f"music/{music}.mp3") # 删除音乐文件
-            await ctx.send(f"```{ctx.author.name}, {music} 已成功删除!```")
+    # 检查播放列表和音乐文件是否存在
+    music_path = f"music/{playlist}/{music_name}.mp3"
+    if not os.path.exists(music_path):
+        await ctx.send(f"```{ctx.author.name}, 在 {playlist} 播放列表中未找到 {music_name}!```")
+        return
 
-        else:
-            await ctx.send(f"```{ctx.author.name}, {music} 不存在!```")
+    # 如果正在播放这首歌，先停止
+    if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
+        current_music = music_queue[current_music_index]
+        if current_music == music_path:
+            voice_client.stop()
+            music_queue.clear()
+            current_music_index = 0
+            await ctx.send(f"```{ctx.author.name}, 已停止当前播放的音乐```")
+
+    try:
+        # 删除音乐文件
+        os.remove(music_path)
+        await ctx.send(f"```{ctx.author.name}, 已从 {playlist} 播放列表中删除 {music_name}!```")
+    except Exception as e:
+        await ctx.send(f"```{ctx.author.name}, 删除音乐文件时发生错误: {str(e)}```")
+
+@music_bot.command(name="delete_music")
+async def delete_music(ctx, music_name):
+    global voice_client, music_queue, current_music_index
+    
+    # 检查音乐文件是否存在
+    music_path = f"music/{music_name}.mp3"
+    if not os.path.exists(music_path):
+        await ctx.send(f"```{ctx.author.name}, 未找到 {music_name}!```")
+        return
+
+    # 如果正在播放这首歌，先停止
+    if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
+        current_music = music_queue[current_music_index]
+        if current_music == music_path:
+            voice_client.stop()
+            music_queue.clear()
+            current_music_index = 0
+            await ctx.send(f"```{ctx.author.name}, 已停止当前播放的音乐```")
+
+    try:
+        # 删除音乐文件
+        os.remove(music_path)
+        await ctx.send(f"```{ctx.author.name}, 已删除 {music_name}!```")
+    except Exception as e:
+        await ctx.send(f"```{ctx.author.name}, 删除音乐文件时发生错误: {str(e)}```")
 
 # 帮助命令
 @music_bot.tree.command(name="help", description="显示所有指令")
