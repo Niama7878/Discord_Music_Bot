@@ -86,14 +86,18 @@ def process_video(url, output_path):
         print(f"下载出错: {str(e)}")
         raise
 
-# 全局变量保存主线程的事件循环
-main_loop = asyncio.get_event_loop()
+# 确保使用 bot 的事件循环
+def get_bot_event_loop(ctx):
+    try:
+        return ctx.bot.loop  # 优先使用 bot 的主循环
+    except AttributeError:
+        return asyncio.get_event_loop()
 
 # 播放音乐函数
 async def play_audio(ctx):
     global current_music_index, music_queue, voice_client
 
-    if len(music_queue) == 0:
+    if not music_queue:
         await ctx.send(f"```{ctx.author.name}, 没有更多的音乐可以播放!```")
         return
 
@@ -101,36 +105,38 @@ async def play_audio(ctx):
     music = music_queue[current_music_index]
     source = discord.FFmpegPCMAudio(executable="ffmpeg.exe", source=music)
     source = discord.PCMVolumeTransformer(source, volume=current_volume)
-    
-    # 使用 partial 传递额外参数
-    voice_client.play(source, after=functools.partial(sync_on_song_end, ctx, main_loop))
+
+    # 确保 after 只传递 error 参数
+    voice_client.play(source, after=lambda error: sync_on_song_end(ctx, error))
 
 # 同步函数调用协程
-def sync_on_song_end(ctx, loop, error):
-    if error:
-        print(f"播放过程中出错: {error}")
-    # 在指定的事件循环中调度协程
-    asyncio.run_coroutine_threadsafe(on_song_end(ctx, error), loop)
+def sync_on_song_end(ctx, error):
+    loop = get_bot_event_loop(ctx)
+
+    if loop.is_running():
+        asyncio.run_coroutine_threadsafe(on_song_end(ctx, error), loop)
+    else:
+        loop.run_until_complete(on_song_end(ctx, error))
 
 # 播放完成后的回调函数
 async def on_song_end(ctx, error):
     global current_music_index, voice_client
 
     if error:
-        print(f"播放过程中出错: {error}")
         await ctx.send(f"```播放过程中发生错误: {error}```")
         return
 
-    # 播放下一首歌曲
+    # 自动播放下一首
     if current_music_index < len(music_queue) - 1:
-        current_music_index += 1  # 更新为下一首歌曲的索引
-        await play_audio(ctx)
+        current_music_index += 1  # 更新索引
+        await ctx.send(f"```{ctx.author.name}, 正在播放下一首音乐 : {music_queue[current_music_index].split('/')[-1]}```")
     else:
-        # 如果播放完所有歌曲，重新从头播放
+        # 播放完列表，重新开始
         current_music_index = 0
-        await ctx.send(f"```{ctx.author.name}, 单曲播放已结束，正在重新从头播放!```")
-        await play_audio(ctx)
-        
+        await ctx.send(f"```{ctx.author.name}, 播放列表已结束，正在重新播放!```")
+
+    await play_audio(ctx)
+
 # 加入语音频道命令
 @music_bot.command(name="join")
 async def join(ctx):
