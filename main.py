@@ -16,6 +16,7 @@ current_volume = 0.5 # 默认音量设置为50%
 music_queue = []  # 歌曲队列
 current_music_index = 0  # 当前播放音乐的索引
 voice_client = None  # 声音客户端（会在每次播放时更新）
+music_stopped = False  # 用于检查音乐是否已停止
 
 # 检查语音频道状态
 async def check_voice_channel(ctx, voice_client):
@@ -94,7 +95,7 @@ def get_bot_event_loop(ctx):
 
 # 播放音乐函数
 async def play_audio(ctx):
-    global current_music_index, music_queue, voice_client
+    global current_music_index, music_queue, voice_client, music_stopped
 
     if not music_queue:
         await ctx.send(f"```{ctx.author.name}, 没有更多的音乐可以播放!```")
@@ -108,6 +109,9 @@ async def play_audio(ctx):
     # 确保 after 只传递 error 参数
     voice_client.play(source, after=lambda error: sync_on_song_end(ctx, error))
 
+    # 恢复自动播放功能
+    music_stopped = False  # 播放音乐后，允许自动播放下一首
+
 # 同步函数调用协程
 def sync_on_song_end(ctx, error):
     loop = get_bot_event_loop(ctx)
@@ -119,11 +123,15 @@ def sync_on_song_end(ctx, error):
 
 # 播放完成后的回调函数
 async def on_song_end(ctx, error):
-    global current_music_index, voice_client
+    global current_music_index, voice_client, music_stopped
 
     if error:
         await ctx.send(f"```播放过程中发生错误: {error}```")
         return
+
+    # 只有当 music_stopped 为 False 时，才会自动播放下一首
+    if music_stopped:  
+        return  # 如果音乐被停止，则不自动播放
 
     # 自动播放下一首
     if current_music_index < len(music_queue) - 1:
@@ -264,23 +272,25 @@ async def resume(ctx):
 # 停止播放音乐命令
 @music_bot.command(name="stop")
 async def stop(ctx):
-    global music_queue, current_music_index
-    voice_client = ctx.guild.voice_client # 获取语音客户端
+    global music_queue, current_music_index, music_stopped
+    voice_client = ctx.guild.voice_client  # 获取语音客户端
 
     if not await check_voice_channel(ctx, voice_client):
         return
 
-    # 如果音乐在播放或已暂停
-    if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
+    if voice_client.is_playing() or voice_client.is_paused():
         await ctx.send(f"```{ctx.author.name}, 正在停止音乐，你可以使用 /play 或 /play_playlist 命令播放新音乐!```")
-        await voice_client.disconnect()
-        await ctx.author.voice.channel.connect()
+
+        music_stopped = True  # 防止触发 on_song_end 误触发
+        voice_client.stop()   # 停止音乐，但不离开语音频道
 
         # 清空音乐队列并重置索引
         music_queue = []
         current_music_index = 0
+
+        # 此时不重置 music_stopped，保持 True 直到播放重新开始
     else:
-        await ctx.send(f"```{ctx.author.name}, 请确保我在语音频道并且音乐是播放或暂停状态!```")
+        await ctx.send(f"```{ctx.author.name}, 目前没有播放中的音乐!```")
 
 # 创建播放列表命令
 @music_bot.command(name="playlist")
