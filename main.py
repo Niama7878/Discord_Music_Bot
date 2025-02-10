@@ -4,7 +4,6 @@ import shutil
 import discord
 import yt_dlp
 from discord.ext import commands
-import functools
 import asyncio
 
 # 设置Discord客户端和机器人命令前缀
